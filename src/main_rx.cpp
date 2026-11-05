@@ -98,7 +98,6 @@ uint32_t bitOffsets[10];                  // instants de lecture des 10 bits
 uint8_t decayShift = 4;                   // constante de temps de l'enveloppe
 uint32_t quarterBit = 0;                  // quart de bit, en mesures
 uint32_t tenBits = 0;                     // durée d'une trame (10 bits), en mesures
-bool prevBlockClean = false;              // bloc de 32 mesures précédent au repos ?
 uint32_t lowCount = 0;                    // mesures "basses" pendant le bit de départ
 
 int32_t mid = 2048 * SCALE;               // centre du signal (≈ 1,65 V)
@@ -107,6 +106,7 @@ int32_t noise = 0;                        // plancher de l'enveloppe (silences)
 int32_t ampOn = 0;                        // crête de l'enveloppe (porteuse)
 int32_t bufferMax = 0;                    // max / min de l'enveloppe sur le tampon
 int32_t bufferMin = 0x7FFFFFFF;            // bruit : plus petit des maxima par bloc de 32 mesures
+bool messageInProgress = false;           // trame F0... en cours de réception
 int32_t thHigh = TH_MIN;
 int32_t thLow = TH_MIN * 3 / 4;
 bool level = false;
@@ -181,12 +181,13 @@ void updateThreshold() {
   } else {
     ampOn -= ampOn >> 7;                   // ≈ 130 ms
   }
-  if (bufferMin != 0x7FFFFFFF) {           // au moins un bloc mesuré au repos
-    if (bufferMin < noise) {
-      noise = bufferMin;
-    } else {
-      noise += (bufferMin - noise) >> 6;
-    }
+  // Le niveau de bruit descend toujours tout de suite. Il ne remonte pas pendant
+  // la réception d'un message (entre F0 et la fin) : une longue suite de porteuse
+  // (image avec beaucoup d'octets 0xFF) ne doit pas être prise pour du bruit.
+  if (bufferMin < noise || noise == 0) {
+    noise = bufferMin;
+  } else if (!messageInProgress) {
+    noise += (bufferMin - noise) >> 6;
   }
   bufferMax = 0;
   bufferMin = 0x7FFFFFFF;
@@ -238,8 +239,6 @@ void processBuffer(const uint16_t *buf) {
   const uint32_t frameLen = tenBits;
   int32_t blkMax = 0;
   uint8_t blk = 0;
-  bool blkDirty = false;
-  bool lPrevClean = prevBlockClean;
 
   for (uint16_t i = 0; i < BUFFER_SIZE; ++i) {
     const uint16_t raw12 = buf[i] & 0x0FFF;
@@ -252,17 +251,10 @@ void processBuffer(const uint16_t *buf) {
     lEnv = (a > lEnv) ? a : lEnv - (lEnv >> shift);
     if (lEnv > lBufMax) lBufMax = lEnv;
     if (lEnv > blkMax) blkMax = lEnv;
-    // Le bruit n'est mesuré que dans des blocs entièrement au repos (pas de
-    // réception en cours, niveau bas), et qui suivent un autre bloc au repos :
-    // on évite ainsi la traîne de l'enveloppe et les longues suites de porteuse
-    // d'une image (octets 0xFF), qui faisaient monter le seuil.
-    if (lStage != BitStage::Idle || lLevel) blkDirty = true;
     if (++blk == 32) {
-      if (!blkDirty && lPrevClean && blkMax < lBufMin) lBufMin = blkMax;
-      lPrevClean = !blkDirty;
+      if (blkMax < lBufMin) lBufMin = blkMax;
       blk = 0;
       blkMax = 0;
-      blkDirty = false;
     }
 
     if (lLevel) {
@@ -277,17 +269,24 @@ void processBuffer(const uint16_t *buf) {
       // Si elle ne retombe pas (traîne de la porteuse quand le dernier bit de
       // données vaut 1, fréquent dans une image), l'octet suivant commence à
       // l'instant prévu, 10 bits après le début du précédent.
+      // On n'enchaîne que si le dernier bit de données valait 1 (seul cas où la
+      // traîne peut masquer le bit de fin) et si la porteuse est franchement
+      // présente : un parasite ne peut pas lancer une chaîne de faux octets.
       if (!lLevel) {
         enqueueReceivedByte(lByte);
         lStage = BitStage::Idle;
       } else if (n - lStart >= frameLen) {
-        enqueueReceivedByte(lByte);
-        lStage = BitStage::Frame;
-        lStart += frameLen;
-        lBit = 0;
-        lByte = 0;
-        lLow = 0;
-        lNext = lStart + bitOffsets[0];
+        if ((lByte & 0x80U) && lEnv > lThH) {
+          enqueueReceivedByte(lByte);
+          lStage = BitStage::Frame;
+          lStart += frameLen;
+          lBit = 0;
+          lByte = 0;
+          lLow = 0;
+          lNext = lStart + bitOffsets[0];
+        } else {
+          lStage = BitStage::Idle;           // octet rejeté (bit de fin absent)
+        }
       }
     } else if (lStage == BitStage::Idle) {
       if (lLevel && !lPrev) {                // début du bit de départ
@@ -341,7 +340,6 @@ void processBuffer(const uint16_t *buf) {
   level = lLevel; prevLevel = lPrev; sampleIndex = n; bitStage = lStage;
   nextSampleAt = lNext; frameStart = lStart; bitIndex = lBit; currentByte = lByte;
   lowCount = lLow;
-  prevBlockClean = lPrevClean;
 }
 
 uint32_t busyMicros = 0;                    // temps passé à traiter (charge CPU)
@@ -435,7 +433,14 @@ void finishMetadata() {
   protocolStage = payloadRemaining == 0 ? ProtocolStage::ReadEot : ProtocolStage::ReadPayload;
 }
 
+void consumeReceivedByteInner(uint8_t value);
+
 void consumeReceivedByte(uint8_t value) {
+  consumeReceivedByteInner(value);
+  messageInProgress = protocolStage != ProtocolStage::WaitSot;
+}
+
+void consumeReceivedByteInner(uint8_t value) {
   switch (protocolStage) {
     case ProtocolStage::WaitSot:
       if (value == SOT) protocolStage = ProtocolStage::WaitType;
