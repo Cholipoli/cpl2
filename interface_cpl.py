@@ -21,6 +21,7 @@ BW_WHITE_IS_ONE = True            # pixel blanc = bit 1, noir = bit 0
 BW_FIRST_PIXEL_IN_MSB = True      # 1er pixel d'un octet dans le bit 7 (D7)
 MAX_TEXT_BYTES = 0xFFFF
 USB_CHUNK_SIZE = 32
+USB_PREFILL_BYTES = 512          # avance initiale (la Due garde 1024 octets en réserve)
 TYPE_TEXT = "TXT"
 TYPE_BW = "IMGBW"
 TYPE_256 = "IMG256"
@@ -729,10 +730,21 @@ class CplTransmitterApp:
                 self._expect_reply(arduino, "READY")
 
                 self.events.put(("status", "Transmission CPL en cours…"))
+                # La Due émet 10 bits par octet (départ + 8 données + fin) et n'a
+                # qu'une petite réserve (1024 octets) : si le PC lui envoie les
+                # octets plus vite qu'elle ne les émet, des octets sont perdus et
+                # elle finit en « USB_TIMEOUT ». On remplit d'abord la réserve,
+                # puis on cale l'envoi sur le débit réel, avec 5 % de marge.
+                seconds_per_byte = 10 * 1.05 / bit_rate
+                t0 = time.monotonic()
                 for start in range(0, len(frame), USB_CHUNK_SIZE):
                     chunk = frame[start : start + USB_CHUNK_SIZE]
                     arduino.write(chunk)
-                    time.sleep(len(chunk) * 8 / bit_rate)
+                    sent_ahead = start + len(chunk) - USB_PREFILL_BYTES
+                    if sent_ahead > 0:
+                        wait = t0 + sent_ahead * seconds_per_byte - time.monotonic()
+                        if wait > 0:
+                            time.sleep(wait)
                     if (start + len(chunk)) % 4096 < USB_CHUNK_SIZE:
                         sent = start + len(chunk)
                         self.events.put(
