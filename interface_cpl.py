@@ -6,14 +6,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import serial
-from PIL import Image, ImageOps, ImageTk
+from PIL import Image, ImageOps, ImageTk, UnidentifiedImageError
 from serial.tools import list_ports
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 BAUD_RATE = 115200
 ARDUINO_VENDOR_IDS = {0x2341, 0x2A03}
 MAX_IMAGE_DIMENSION = 4096        # limite acceptée (le cahier des charges code L et C sur 2 octets)
-SUGGESTED_IMAGE_DIMENSION = 320   # au-delà, on PROPOSE de réduire (durée d'envoi)
+SUGGESTED_IMAGE_DIMENSION = 320   # au-delà, l'image est réduite automatiquement (durée d'envoi)
 
 # Conventions IMG-BW non précisées par le cahier des charges (à confirmer avec
 # l'encadrant et à garder identiques à l'émetteur et au récepteur) :
@@ -21,7 +21,6 @@ BW_WHITE_IS_ONE = True            # pixel blanc = bit 1, noir = bit 0
 BW_FIRST_PIXEL_IN_MSB = True      # 1er pixel d'un octet dans le bit 7 (D7)
 MAX_TEXT_BYTES = 0xFFFF
 USB_CHUNK_SIZE = 32
-USB_PREFILL_BYTES = 512          # avance initiale (la Due garde 1024 octets en réserve)
 TYPE_TEXT = "TXT"
 TYPE_BW = "IMGBW"
 TYPE_256 = "IMG256"
@@ -61,25 +60,33 @@ def _bw_bit(index):
     return 7 - index % 8 if BW_FIRST_PIXEL_IN_MSB else index % 8
 
 
-def encode_image(path, mode, resize_image):
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source)
-        image.load()
+def prepare_image(path, mode):
+    """Convertit n'importe quelle image au format du cahier des charges.
+
+    Retourne (aperçu, corps) : l'aperçu est l'image telle que le récepteur
+    l'affichera, le corps est le champ « Data size + payload » à transmettre.
+    """
+    try:
+        with Image.open(path) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+    except UnidentifiedImageError as error:
+        raise ValueError(
+            "Ce fichier n'est pas une image reconnue "
+            "(formats acceptés : PNG, JPG, BMP, GIF, TIFF, WEBP)."
+        ) from error
 
     if image.width < 1 or image.height < 1:
         raise ValueError("L'image ne contient aucun pixel.")
 
+    # Réduction automatique (proportions conservées) pour limiter la durée d'envoi.
     if image.width > SUGGESTED_IMAGE_DIMENSION or image.height > SUGGESTED_IMAGE_DIMENSION:
-        if resize_image():
-            image.thumbnail(
-                (SUGGESTED_IMAGE_DIMENSION, SUGGESTED_IMAGE_DIMENSION),
-                Image.Resampling.LANCZOS,
-            )
-    if image.width > MAX_IMAGE_DIMENSION or image.height > MAX_IMAGE_DIMENSION:
-        raise ValueError(
-            f"L'image dépasse {MAX_IMAGE_DIMENSION} × {MAX_IMAGE_DIMENSION} pixels."
+        image.thumbnail(
+            (SUGGESTED_IMAGE_DIMENSION, SUGGESTED_IMAGE_DIMENSION),
+            Image.Resampling.LANCZOS,
         )
 
+    # Transparence -> fond blanc ; tout le reste -> RVB.
     if "A" in image.getbands() or "transparency" in image.info:
         rgba = image.convert("RGBA")
         background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
@@ -99,12 +106,16 @@ def encode_image(path, mode, resize_image):
         for index, pixel in enumerate(pixels):
             if bool(pixel) == BW_WHITE_IS_ONE:
                 packed[index // 8] |= 1 << _bw_bit(index)
-        return dimensions + packed
+        return monochrome.convert("RGB"), dimensions + bytes(packed)
 
     quantized = image.quantize(colors=256, method=Image.Quantize.FASTOCTREE)
     palette = (quantized.getpalette() or [])[:768]
     palette.extend([0] * (768 - len(palette)))
-    return dimensions + bytes(palette) + quantized.tobytes()
+    return quantized.convert("RGB"), dimensions + bytes(palette) + quantized.tobytes()
+
+
+def encode_image(path, mode, resize_image=None):
+    return prepare_image(path, mode)[1]
 
 
 class CplTransmitterApp:
@@ -121,6 +132,8 @@ class CplTransmitterApp:
         self.receiver_stop = threading.Event()
         self.receiver_thread = None
         self.image_path = None
+        self.image_preview_photo = None
+        self.image_original_size = (0, 0)
         self.received_photo = None
         self.last_received = None
         self.role_var = tk.StringVar(value=ROLE_TRANSMITTER)
@@ -192,6 +205,8 @@ class CplTransmitterApp:
             width=24,
         )
         self.rate_box.grid(row=4, column=1, sticky="ew", padx=10, pady=5)
+        self.rate_box.bind("<<ComboboxSelected>>", lambda _event: self._update_image_preview())
+        self.rate_box.bind("<FocusOut>", lambda _event: self._update_image_preview())
 
         content = ttk.LabelFrame(container, text="Données à transmettre", padding=12)
         content.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(15, 10))
@@ -519,9 +534,14 @@ class CplTransmitterApp:
         return mode, image
 
     @staticmethod
-    def _preview(image):
-        # Agrandit les petites images (pixels nets) pour qu'elles restent lisibles.
-        factor = max(1, min(400 // max(image.width, 1), 400 // max(image.height, 1)))
+    def _preview(image, size=400):
+        # Réduit les grandes images, agrandit les petites (pixels nets) pour
+        # qu'elles restent lisibles à l'écran.
+        if image.width > size or image.height > size:
+            shown = image.copy()
+            shown.thumbnail((size, size), Image.Resampling.NEAREST)
+            return shown
+        factor = max(1, min(size // max(image.width, 1), size // max(image.height, 1)))
         if factor > 1:
             return image.resize(
                 (image.width * factor, image.height * factor), Image.Resampling.NEAREST
@@ -600,6 +620,7 @@ class CplTransmitterApp:
         else:
             self.text_frame.grid_remove()
             self.image_frame.grid()
+            self._update_image_preview()
 
     def _choose_image(self):
         path = filedialog.askopenfilename(
@@ -622,18 +643,45 @@ class CplTransmitterApp:
         try:
             with Image.open(path) as image:
                 width, height = image.size
-            self.image_path = str(Path(path))
-            self.image_info_var.set(
-                f"{Path(path).name}\n{width} × {height} pixels"
-                + (
-                    f" (réduction à {SUGGESTED_IMAGE_DIMENSION} × "
-                    f"{SUGGESTED_IMAGE_DIMENSION} proposée à l’envoi)"
-                    if width > SUGGESTED_IMAGE_DIMENSION or height > SUGGESTED_IMAGE_DIMENSION
-                    else ""
-                )
+        except (OSError, ValueError, UnidentifiedImageError):
+            messagebox.showerror(
+                "Image invalide",
+                "Ce fichier n'est pas une image reconnue "
+                "(formats acceptés : PNG, JPG, BMP, GIF, TIFF, WEBP).",
+                parent=self.root,
             )
+            return
+        self.image_path = str(Path(path))
+        self.image_original_size = (width, height)
+        self._update_image_preview()
+
+    def _update_image_preview(self):
+        """Montre l'image telle qu'elle sera envoyée (convertie et réduite)."""
+        if not self.image_path or self.mode_var.get() == TYPE_TEXT:
+            return
+        mode = self.mode_var.get()
+        try:
+            preview, body = prepare_image(self.image_path, mode)
         except (OSError, ValueError) as error:
             messagebox.showerror("Image invalide", str(error), parent=self.root)
+            return
+        frame_size = len(body) + 3
+        try:
+            rate = int(self.rate_var.get())
+        except ValueError:
+            rate = 0
+        duration = (
+            f", ≈ {self._format_duration(frame_size * 10 / rate)} à {rate:,} bit/s"
+            if rate > 0 else ""
+        )
+        width, height = self.image_original_size
+        self.image_preview_photo = ImageTk.PhotoImage(self._preview(preview, 260))
+        self.drop_target.configure(image=self.image_preview_photo, compound="top")
+        self.image_info_var.set(
+            f"{Path(self.image_path).name} ({width} × {height})\n"
+            f"envoyée en {mode} : {preview.width} × {preview.height} pixels, "
+            f"{frame_size:,} octets{duration}"
+        )
 
     def _collect_transfer(self):
         mode = self.mode_var.get()
@@ -651,18 +699,7 @@ class CplTransmitterApp:
         else:
             if not self.image_path:
                 raise ValueError("Sélectionne d’abord une image.")
-            payload = encode_image(
-                self.image_path,
-                mode,
-                resize_image=lambda: messagebox.askyesno(
-                    "Réduire l’image ?",
-                    f"L’image dépasse {SUGGESTED_IMAGE_DIMENSION} × "
-                    f"{SUGGESTED_IMAGE_DIMENSION} pixels, son envoi sera long.\n"
-                    "La réduire automatiquement ? (Non = l’envoyer en taille réelle)",
-                    parent=self.root,
-                ),
-            )
-            body = payload
+            body = prepare_image(self.image_path, mode)[1]
 
         try:
             bit_rate = int(self.rate_var.get())
@@ -730,21 +767,13 @@ class CplTransmitterApp:
                 self._expect_reply(arduino, "READY")
 
                 self.events.put(("status", "Transmission CPL en cours…"))
-                # La Due émet 10 bits par octet (départ + 8 données + fin) et n'a
-                # qu'une petite réserve (1024 octets) : si le PC lui envoie les
-                # octets plus vite qu'elle ne les émet, des octets sont perdus et
-                # elle finit en « USB_TIMEOUT ». On remplit d'abord la réserve,
-                # puis on cale l'envoi sur le débit réel, avec 5 % de marge.
-                seconds_per_byte = 10 * 1.05 / bit_rate
-                t0 = time.monotonic()
                 for start in range(0, len(frame), USB_CHUNK_SIZE):
                     chunk = frame[start : start + USB_CHUNK_SIZE]
                     arduino.write(chunk)
-                    sent_ahead = start + len(chunk) - USB_PREFILL_BYTES
-                    if sent_ahead > 0:
-                        wait = t0 + sent_ahead * seconds_per_byte - time.monotonic()
-                        if wait > 0:
-                            time.sleep(wait)
+                    # La Due émet 10 bits par octet (départ + 8 + fin) et n'a qu'une
+                    # réserve de 1024 octets : on ne lui envoie pas les octets plus
+                    # vite qu'elle ne les émet (sinon « USB_TIMEOUT » sur les images).
+                    time.sleep(len(chunk) * 10.5 / bit_rate)
                     if (start + len(chunk)) % 4096 < USB_CHUNK_SIZE:
                         sent = start + len(chunk)
                         self.events.put(
