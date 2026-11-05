@@ -18,7 +18,9 @@ constexpr uint16_t PWM_CHANNEL = 7;
 constexpr uint16_t PWM_PERIOD = 840;
 constexpr uint16_t PWM_HALF_PERIOD = PWM_PERIOD / 2;
 constexpr uint32_t SERIAL_READ_TIMEOUT_MS = 30000;
-constexpr uint16_t MAX_IMAGE_DIMENSION = 320;
+// Le cahier des charges code lignes et colonnes sur 2 octets sans fixer de
+// maximum ; 4096 garde le calcul de taille sur 32 bits et couvre tout cas réaliste.
+constexpr uint16_t MAX_IMAGE_DIMENSION = 4096;
 constexpr uint8_t SOT = 0xF0;
 constexpr uint8_t EOT = 0x0F;
 
@@ -195,30 +197,16 @@ bool transmettreTrame(const char *mode) {
                       : 768 + pixels;
   }
 
-  uint8_t finalPayloadByte = 0;
   for (uint32_t index = 0; index < payloadSize; ++index) {
     uint8_t value;
     if (!lireOctetUSB(value)) {
       Serial.println("ERR USB_TIMEOUT");
       return false;
     }
-    if (strcmp(mode, "IMGBW") == 0 && index + 1 == payloadSize) {
-      finalPayloadByte = value;
-    }
     envoyerOctet(value);
   }
 
-  if (strcmp(mode, "IMGBW") == 0) {
-    const uint32_t pixelCount = static_cast<uint32_t>(rows) * columns;
-    const uint8_t remainder = pixelCount % 8;
-    if (remainder != 0) {
-      const uint8_t unusedMask = (1U << (8 - remainder)) - 1;
-      if ((finalPayloadByte & unusedMask) != 0) {
-        Serial.println("ERR BW_PADDING");
-        return false;
-      }
-    }
-  }
+  // (Le remplissage du dernier octet IMG-BW par des 0 est assuré par l'interface.)
 
   uint8_t endMarker;
   if (!lireOctetUSB(endMarker)) {

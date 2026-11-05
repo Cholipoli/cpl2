@@ -12,7 +12,13 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 
 BAUD_RATE = 115200
 ARDUINO_VENDOR_IDS = {0x2341, 0x2A03}
-MAX_IMAGE_DIMENSION = 320
+MAX_IMAGE_DIMENSION = 4096        # limite acceptée (le cahier des charges code L et C sur 2 octets)
+SUGGESTED_IMAGE_DIMENSION = 320   # au-delà, on PROPOSE de réduire (durée d'envoi)
+
+# Conventions IMG-BW non précisées par le cahier des charges (à confirmer avec
+# l'encadrant et à garder identiques à l'émetteur et au récepteur) :
+BW_WHITE_IS_ONE = True            # pixel blanc = bit 1, noir = bit 0
+BW_FIRST_PIXEL_IN_MSB = True      # 1er pixel d'un octet dans le bit 7 (D7)
 MAX_TEXT_BYTES = 0xFFFF
 USB_CHUNK_SIZE = 32
 TYPE_TEXT = "TXT"
@@ -49,6 +55,11 @@ def build_cpl_frame(mode, body):
     return bytes((SOT, MESSAGE_TYPES[mode])) + body + bytes((EOT,))
 
 
+def _bw_bit(index):
+    """Position (0 à 7) dans son octet du bit du pixel n° index."""
+    return 7 - index % 8 if BW_FIRST_PIXEL_IN_MSB else index % 8
+
+
 def encode_image(path, mode, resize_image):
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source)
@@ -57,10 +68,16 @@ def encode_image(path, mode, resize_image):
     if image.width < 1 or image.height < 1:
         raise ValueError("L'image ne contient aucun pixel.")
 
+    if image.width > SUGGESTED_IMAGE_DIMENSION or image.height > SUGGESTED_IMAGE_DIMENSION:
+        if resize_image():
+            image.thumbnail(
+                (SUGGESTED_IMAGE_DIMENSION, SUGGESTED_IMAGE_DIMENSION),
+                Image.Resampling.LANCZOS,
+            )
     if image.width > MAX_IMAGE_DIMENSION or image.height > MAX_IMAGE_DIMENSION:
-        if not resize_image:
-            raise ValueError("Le redimensionnement a été annulé.")
-        image.thumbnail((MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION), Image.Resampling.LANCZOS)
+        raise ValueError(
+            f"L'image dépasse {MAX_IMAGE_DIMENSION} × {MAX_IMAGE_DIMENSION} pixels."
+        )
 
     if "A" in image.getbands() or "transparency" in image.info:
         rgba = image.convert("RGBA")
@@ -77,10 +94,10 @@ def encode_image(path, mode, resize_image):
             lambda value: 255 if value >= 128 else 0
         )
         pixels = monochrome.tobytes()
-        packed = bytearray((len(pixels) + 7) // 8)
+        packed = bytearray((len(pixels) + 7) // 8)   # fin complétée par des 0
         for index, pixel in enumerate(pixels):
-            if pixel:
-                packed[index // 8] |= 1 << (7 - index % 8)
+            if bool(pixel) == BW_WHITE_IS_ONE:
+                packed[index // 8] |= 1 << _bw_bit(index)
         return dimensions + packed
 
     quantized = image.quantize(colors=256, method=Image.Quantize.FASTOCTREE)
@@ -104,10 +121,11 @@ class CplTransmitterApp:
         self.receiver_thread = None
         self.image_path = None
         self.received_photo = None
+        self.last_received = None
         self.role_var = tk.StringVar(value=ROLE_TRANSMITTER)
         self.mode_var = tk.StringVar(value=TYPE_TEXT)
         self.port_var = tk.StringVar()
-        self.rate_var = tk.StringVar(value="1000")
+        self.rate_var = tk.StringVar(value="25000")
         self.status_var = tk.StringVar(value="Prêt.")
         self.image_info_var = tk.StringVar(
             value="Glisse une image ici ou sélectionne un fichier."
@@ -272,6 +290,13 @@ class CplTransmitterApp:
             row=0, column=0, columnspan=2, sticky="nsew"
         )
         self.received_image.grid_remove()
+        self.save_button = ttk.Button(
+            self.receive_frame,
+            text="Enregistrer le dernier message reçu…",
+            command=self._save_last_received,
+            state="disabled",
+        )
+        self.save_button.grid(row=1, column=1, sticky="e", pady=(8, 0))
 
         footer = ttk.Frame(container)
         footer.grid(row=6, column=0, columnspan=3, sticky="ew")
@@ -472,18 +497,15 @@ class CplTransmitterApp:
 
     def _decode_received(self, mode, payload, rows, columns):
         if mode == TYPE_TEXT:
-            try:
-                return mode, payload.decode("ascii")
-            except UnicodeDecodeError as error:
-                raise RuntimeError("Le texte reçu contient des octets non ASCII.") from error
+            # Un octet abîmé par la ligne ne doit pas arrêter l'écoute : il
+            # s'affiche comme « ? ».
+            return mode, payload.decode("ascii", errors="replace").replace("\ufffd", "?")
 
         pixels_count = rows * columns
         if mode == TYPE_BW:
-            remainder = pixels_count % 8
-            if remainder and payload[-1] & ((1 << (8 - remainder)) - 1):
-                raise RuntimeError("Bits de remplissage BW non nuls dans le dernier octet.")
+            # Les bits de remplissage du dernier octet sont ignorés.
             pixels = bytes(
-                255 if (payload[index // 8] >> (7 - index % 8)) & 1 else 0
+                255 if bool((payload[index // 8] >> _bw_bit(index)) & 1) == BW_WHITE_IS_ONE else 0
                 for index in range(pixels_count)
             )
             image = Image.frombytes("L", (columns, rows), pixels)
@@ -494,6 +516,22 @@ class CplTransmitterApp:
             image.putpalette(list(palette))
             image = image.convert("RGB")
         return mode, image
+
+    @staticmethod
+    def _preview(image):
+        # Agrandit les petites images (pixels nets) pour qu'elles restent lisibles.
+        factor = max(1, min(400 // max(image.width, 1), 400 // max(image.height, 1)))
+        if factor > 1:
+            return image.resize(
+                (image.width * factor, image.height * factor), Image.Resampling.NEAREST
+            )
+        return image
+
+    def _save_last_received(self):
+        if self.last_received is None:
+            self.status_var.set("Rien à enregistrer pour l’instant.")
+            return
+        self._save_received(*self.last_received)
 
     def _save_received(self, mode, data):
         try:
@@ -587,9 +625,9 @@ class CplTransmitterApp:
             self.image_info_var.set(
                 f"{Path(path).name}\n{width} × {height} pixels"
                 + (
-                    f" (réduction à {MAX_IMAGE_DIMENSION} × "
-                    f"{MAX_IMAGE_DIMENSION} proposée à l’envoi)"
-                    if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION
+                    f" (réduction à {SUGGESTED_IMAGE_DIMENSION} × "
+                    f"{SUGGESTED_IMAGE_DIMENSION} proposée à l’envoi)"
+                    if width > SUGGESTED_IMAGE_DIMENSION or height > SUGGESTED_IMAGE_DIMENSION
                     else ""
                 )
             )
@@ -616,9 +654,10 @@ class CplTransmitterApp:
                 self.image_path,
                 mode,
                 resize_image=lambda: messagebox.askyesno(
-                    "Redimensionner l’image",
-                    f"L’image dépasse {MAX_IMAGE_DIMENSION} × "
-                    f"{MAX_IMAGE_DIMENSION} pixels. La réduire automatiquement ?",
+                    "Réduire l’image ?",
+                    f"L’image dépasse {SUGGESTED_IMAGE_DIMENSION} × "
+                    f"{SUGGESTED_IMAGE_DIMENSION} pixels, son envoi sera long.\n"
+                    "La réduire automatiquement ? (Non = l’envoyer en taille réelle)",
                     parent=self.root,
                 ),
             )
@@ -770,13 +809,22 @@ class CplTransmitterApp:
                         self.received_text.insert("end", data + "\n")
                         self.received_text.see("end")
                         self.received_text.configure(state="disabled")
-                        self._save_received(mode, data)
+                        self.status_var.set(
+                            "Texte reçu. « Enregistrer… » pour le sauvegarder."
+                        )
                     else:
                         self.received_text_frame.grid_remove()
                         self.received_image.grid()
-                        self.received_photo = ImageTk.PhotoImage(data)
+                        self.received_photo = ImageTk.PhotoImage(
+                            self._preview(data)
+                        )
                         self.received_image.configure(image=self.received_photo, text="")
-                        self._save_received(mode, data)
+                        self.status_var.set(
+                            f"Image reçue ({data.width} × {data.height} pixels). "
+                            "« Enregistrer… » pour la sauvegarder."
+                        )
+                    self.last_received = (mode, data)
+                    self.save_button.configure(state="normal")
                 else:
                     self.sending = False
                     self.send_button.configure(state="normal")
