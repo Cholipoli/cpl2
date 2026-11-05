@@ -38,10 +38,10 @@ constexpr uint32_t MAX_BIT_RATE = 50000;
 constexpr float SAMPLE_POSITION = 0.5f;   // lecture au milieu du bit
 constexpr int32_t SCALE = 16;             // calcul en 1/16 de pas ADC
 constexpr int32_t TH_MIN = 100 * SCALE;   // seuil minimal ≈ 80 mV
-constexpr int32_t NOISE_FACTOR_X2 = 5;    // seuil >= 2,5 x niveau de bruit
+constexpr int32_t NOISE_FACTOR_X2 = 7;    // seuil >= 3,5 x niveau de bruit
 
 // ---------------------------------------------------------------- ADC + DMA
-constexpr uint8_t NB_BUFFERS = 8;
+constexpr uint8_t NB_BUFFERS = 16;     // ≈ 25 ms de réserve
 constexpr uint16_t BUFFER_SIZE = 1024;    // ≈ 1 ms par tampon
 uint16_t adcBuffer[NB_BUFFERS][BUFFER_SIZE];
 volatile uint32_t buffersDone = 0;        // tampons remplis par la DMA
@@ -219,13 +219,20 @@ void enqueueReceivedByte(uint8_t value) {
   ++statBytes;
 }
 
-// Traitement d'un tampon complet. Toutes les variables d'état sont copiées
-// dans des variables locales (registres du processeur) pendant la boucle :
-// c'est nettement plus rapide que de relire / réécrire la mémoire à chaque
-// mesure, ce qui compte à ~665 000 mesures par seconde.
-void processBuffer(const uint16_t *buf) {
+// Traitement d'un tampon complet : c'est LA partie qui doit être rapide.
+// À ~665 000 mesures/s, il reste ~125 cycles du processeur par mesure. Pour ne
+// jamais prendre de retard sur la DMA (sinon des tampons sont sautés, des octets
+// perdus, et la trame est rejetée « EOT incorrect » dès qu'elle est un peu longue) :
+//  - la fonction est copiée en RAM au démarrage (RAMFUNC) : la mémoire flash de
+//    la Due a 4 cycles d'attente, très pénalisants pour une boucle pleine de sauts ;
+//  - les variables d'état sont copiées dans des variables locales (registres) ;
+//  - les calculs « lents » (centre, bruit, min/max de débogage) sont faits une
+//    fois par bloc de 32 mesures au lieu de chaque mesure ;
+//  - au repos (pas de porteuse, pas de trame en cours) la machine UART est sautée.
+#define RAMFUNC __attribute__((noinline, optimize("O2"), section(".ramfunc")))
+RAMFUNC void processBuffer(const uint16_t *buf) {
   int32_t lMid = mid, lEnv = env, lThH = thHigh, lThL = thLow;
-  int32_t lBufMax = bufferMax, lBufMin = bufferMin, lDbgEnvMax = dbgEnvMax;
+  int32_t lBufMax = bufferMax, lBufMin = bufferMin;
   uint16_t lDbgMin = dbgMin, lDbgMax = dbgMax;
   uint32_t lEdges = dbgEdges;
   bool lLevel = level, lPrev = prevLevel;
@@ -237,109 +244,115 @@ void processBuffer(const uint16_t *buf) {
   const uint8_t shift = decayShift;
   const uint32_t quarter = quarterBit;
   const uint32_t frameLen = tenBits;
-  int32_t blkMax = 0;
-  uint8_t blk = 0;
+  uint16_t pending[8];                       // octets décodés dans ce tampon
+  uint8_t nPending = 0;
 
-  for (uint16_t i = 0; i < BUFFER_SIZE; ++i) {
-    const uint16_t raw12 = buf[i] & 0x0FFF;
-    if (raw12 < lDbgMin) lDbgMin = raw12;
-    if (raw12 > lDbgMax) lDbgMax = raw12;
-    const int32_t x = static_cast<int32_t>(raw12) * SCALE;
-    lMid += (x - lMid) >> 12;                // centre : moyenne sur ≈ 6 ms
-    int32_t a = x - lMid;
-    if (a < 0) a = -a;
-    lEnv = (a > lEnv) ? a : lEnv - (lEnv >> shift);
-    if (lEnv > lBufMax) lBufMax = lEnv;
-    if (lEnv > blkMax) blkMax = lEnv;
-    if (++blk == 32) {
-      if (blkMax < lBufMin) lBufMin = blkMax;
-      blk = 0;
-      blkMax = 0;
-    }
+  for (const uint16_t *blkPtr = buf; blkPtr < buf + BUFFER_SIZE; blkPtr += 32) {
+    int32_t blkMax = 0;
+    int32_t blkSum = 0;
+    uint16_t raw12 = 0;
+    for (uint8_t j = 0; j < 32; ++j) {
+      raw12 = blkPtr[j] & 0x0FFF;
+      const int32_t x = static_cast<int32_t>(raw12) * SCALE;
+      blkSum += x;
+      int32_t a = x - lMid;
+      if (a < 0) a = -a;
+      lEnv = (a > lEnv) ? a : lEnv - (lEnv >> shift);
+      if (lEnv > blkMax) blkMax = lEnv;
 
-    if (lLevel) {
-      if (lEnv < lThL) lLevel = false;
-    } else if (lEnv > lThH) {
-      lLevel = true;
-    }
-    ++n;
+      if (lLevel) {
+        if (lEnv < lThL) lLevel = false;
+      } else if (lEnv > lThH) {
+        lLevel = true;
+      }
+      ++n;
 
-    if (lStage == BitStage::Stop) {
-      // Bit de fin (0) attendu : on accepte l'octet dès que l'enveloppe retombe.
-      // Si elle ne retombe pas (traîne de la porteuse quand le dernier bit de
-      // données vaut 1, fréquent dans une image), l'octet suivant commence à
-      // l'instant prévu, 10 bits après le début du précédent.
-      // On n'enchaîne que si le dernier bit de données valait 1 (seul cas où la
-      // traîne peut masquer le bit de fin) et si la porteuse est franchement
-      // présente : un parasite ne peut pas lancer une chaîne de faux octets.
-      if (!lLevel) {
-        enqueueReceivedByte(lByte);
-        lStage = BitStage::Idle;
-      } else if (n - lStart >= frameLen) {
-        if ((lByte & 0x80U) && lEnv > lThH) {
-          enqueueReceivedByte(lByte);
+      if (lStage == BitStage::Idle) {
+        if (lLevel && !lPrev) {                // début du bit de départ
+          ++lEdges;
           lStage = BitStage::Frame;
-          lStart += frameLen;
+          lStart = n;
           lBit = 0;
           lByte = 0;
           lLow = 0;
           lNext = lStart + bitOffsets[0];
-        } else {
-          lStage = BitStage::Idle;           // octet rejeté (bit de fin absent)
         }
-      }
-    } else if (lStage == BitStage::Idle) {
-      if (lLevel && !lPrev) {                // début du bit de départ
-        ++lEdges;
-        lStage = BitStage::Frame;
-        lStart = n;
-        lBit = 0;
-        lByte = 0;
-        lLow = 0;
-        lNext = lStart + bitOffsets[0];
-      }
-    } else if (lBit == 0 && n != lNext && !lLevel) {
-      // Pendant le bit de départ, l'enveloppe ne doit pas retomber plus d'un
-      // quart de bit d'affilée ; sinon c'était un parasite : on se remet à l'affût.
-      if (++lLow > quarter) lStage = BitStage::Idle;
-    } else if (n == lNext) {
-      const bool bit = lLevel;
-      if (lBit == 0) {
-        if (!bit) {
-          lStage = BitStage::Idle;           // pas de porteuse au milieu : faux départ
-        } else if (lEnv > ampOn) {
-          // Premier message après un long silence : on cale tout de suite le
-          // seuil sur l'amplitude du bit de départ.
-          ampOn = lEnv;
-          computeThresholds();
-          lThH = thHigh;
-          lThL = thLow;
-        }
-      } else if (lBit <= 8) {
-        if (bit) lByte |= static_cast<uint8_t>(1U << (lBit - 1));
-      } else {                               // bit de fin : doit être 0
-        if (!bit) {
-          enqueueReceivedByte(lByte);
+      } else if (lStage == BitStage::Stop) {
+        // Bit de fin (0) attendu : on accepte l'octet dès que l'enveloppe retombe.
+        // Si elle ne retombe pas (traîne de la porteuse quand le dernier bit de
+        // données vaut 1, fréquent dans une image), l'octet suivant commence à
+        // l'instant prévu, 10 bits après le début du précédent, mais seulement
+        // si la porteuse est franchement présente (pas sur un parasite).
+        if (!lLevel) {
+          pending[nPending++ & 7] = lByte;
           lStage = BitStage::Idle;
-        } else {
-          ++statFraming;                     // pas encore retombé : on attend
-          lStage = BitStage::Stop;
+        } else if (n - lStart >= frameLen) {
+          if ((lByte & 0x80U) && lEnv > lThH) {
+            pending[nPending++ & 7] = lByte;
+            lStage = BitStage::Frame;
+            lStart += frameLen;
+            lBit = 0;
+            lByte = 0;
+            lLow = 0;
+            lNext = lStart + bitOffsets[0];
+          } else {
+            lStage = BitStage::Idle;           // octet rejeté (bit de fin absent)
+          }
         }
+      } else if (n == lNext) {
+        const bool bit = lLevel;
+        if (lBit == 0) {
+          if (!bit) {
+            lStage = BitStage::Idle;           // pas de porteuse au milieu : faux départ
+          } else if (lEnv > ampOn) {
+            // Premier message après un long silence : on cale tout de suite le
+            // seuil sur l'amplitude du bit de départ.
+            ampOn = lEnv;
+            int32_t th = (ampOn + noise) / 2;
+            if (th < NOISE_FACTOR_X2 * noise / 2) th = NOISE_FACTOR_X2 * noise / 2;
+            if (th < TH_MIN) th = TH_MIN;
+            lThH = th;
+            lThL = th - th / 4;
+          }
+        } else if (lBit <= 8) {
+          if (bit) lByte |= static_cast<uint8_t>(1U << (lBit - 1));
+        } else {                               // bit de fin : doit être 0
+          if (!bit) {
+            pending[nPending++ & 7] = lByte;
+            lStage = BitStage::Idle;
+          } else {
+            ++statFraming;                     // pas encore retombé : on attend
+            lStage = BitStage::Stop;
+          }
+        }
+        if (lStage == BitStage::Frame) {
+          ++lBit;
+          lNext = lStart + bitOffsets[lBit];
+        }
+      } else if (lBit == 0 && !lLevel) {
+        // Pendant le bit de départ, l'enveloppe ne doit pas retomber plus d'un
+        // quart de bit d'affilée ; sinon c'était un parasite : on se remet à l'affût.
+        if (++lLow > quarter) lStage = BitStage::Idle;
       }
-      if (lStage == BitStage::Frame) {
-        ++lBit;
-        lNext = lStart + bitOffsets[lBit];
-      }
+      lPrev = lLevel;
     }
-    lPrev = lLevel;
+    // Une fois par bloc de 32 mesures (~50 µs) :
+    lMid += (blkSum / 32 - lMid) >> 7;         // centre : moyenne sur ≈ 6 ms
+    if (blkMax > lBufMax) lBufMax = blkMax;
+    if (blkMax < lBufMin) lBufMin = blkMax;    // bruit : plus petit maximum de bloc
+    if (raw12 < lDbgMin) lDbgMin = raw12;      // débogage : une mesure par bloc suffit
+    if (raw12 > lDbgMax) lDbgMax = raw12;
   }
-  if (lBufMax > lDbgEnvMax) lDbgEnvMax = lBufMax;
+  if (lBufMax > dbgEnvMax) dbgEnvMax = lBufMax;
 
   mid = lMid; env = lEnv; bufferMax = lBufMax; bufferMin = lBufMin;
-  dbgEnvMax = lDbgEnvMax; dbgMin = lDbgMin; dbgMax = lDbgMax; dbgEdges = lEdges;
+  dbgMin = lDbgMin; dbgMax = lDbgMax; dbgEdges = lEdges;
+  thHigh = lThH; thLow = lThL;
   level = lLevel; prevLevel = lPrev; sampleIndex = n; bitStage = lStage;
   nextSampleAt = lNext; frameStart = lStart; bitIndex = lBit; currentByte = lByte;
   lowCount = lLow;
+  // Octets décodés : rangés pour loop() (au plus ~4 par tampon à 50 kbit/s).
+  for (uint8_t k = 0; k < nPending && k < 8; ++k) enqueueReceivedByte(static_cast<uint8_t>(pending[k]));
 }
 
 uint32_t busyMicros = 0;                    // temps passé à traiter (charge CPU)
